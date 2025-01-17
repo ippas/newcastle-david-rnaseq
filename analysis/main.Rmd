@@ -1,0 +1,215 @@
+---
+title: "main"
+output: html_document
+date: "2025-01-12"
+---
+
+```{r eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+# https://github.com/Bioconductor/bioconductor_docker/issues/22
+BiocManager::install("preprocessCore", configure.args="--disable-threading")
+BiocManager::install("edgeR")
+
+
+library(devtools)
+devtools::install_github("jokergoo/ComplexHeatmap")
+```
+
+```{r load_libraries}
+library(tidyverse)
+library(preprocessCore)
+library(edgeR)
+library(ComplexHeatmap)
+library(scales)
+library(ggpubr)
+library(RColorBrewer)
+library(circlize)
+library(rtracklayer)
+library(readr)
+
+
+add_gene_info <- function(gtf_file, ensembl_ids) {
+  gtf_data <- import(gtf_file)
+  
+  gtf_df <- as.data.frame(gtf_data)
+  
+  ensembl_ids <- unique(ensembl_ids)
+  
+  gene_info <- gtf_df %>%
+    filter(gene_id %in% ensembl_ids) %>%
+    select(gene_id, gene_name, gene_biotype) %>%
+    distinct()
+  
+  result_df <- data.frame(gene_id = ensembl_ids)
+  
+  result_df <- result_df %>%
+    left_join(gene_info, by = c("gene_id" = "gene_id"))
+  
+  return(result_df)
+}
+```
+
+```{r read_data}
+sample_info <- read_tsv('raw/sample_groups_anim.txt')
+
+gtf_info <- add_gene_info(
+  'data/Rattus_norvegicus.mRatBN7.2.112.chr.gtf.gz',
+  read_tsv('data/salmon.merged.gene_counts.tsv')$gene_id
+)
+gene_counts <-
+  read_tsv('data/salmon.merged.gene_counts.tsv') %>%
+  select(-gene_name) %>%
+  left_join(gtf_info, by = 'gene_id')
+```
+
+```{r edger}
+x <- gene_counts %>% select(all_of(sample_info$sample))
+groups. <-
+  sample_info %>%
+  `[`(match(colnames(x), .$sample), ) %>%
+  pull(side) %>%
+  factor()
+
+dge_counts <- DGEList(
+  counts = x,
+  group = groups.,
+  genes = select(gene_counts, -all_of(sample_info$sample))
+)
+keep_counts <- filterByExpr(dge_counts)
+dge_counts <- dge_counts[keep_counts, , keep.lib.sizes = FALSE]
+dge_counts <- calcNormFactors(dge_counts)
+design <- model.matrix(~ 0 + groups.)
+dge_counts <- estimateDisp(dge_counts, design)
+
+fit <- glmQLFit(dge_counts, design)
+
+contrasts <- makeContrasts(
+  model=(
+    groups.Ipsi - groups.Contra
+  ),
+  levels = design
+)
+
+results <- glmQLFTest(fit, contrast=contrasts[, 'model'])
+
+model <-
+  topTags(results, n = 'inf', sort.by = 'none')$table %>%
+  as_tibble(rownames = 'row_index') %>%
+  select(-row_index)
+```
+
+```{r}
+model %>% 
+    write_csv('results/edger/rnaseq-edger-statistics.csv')
+```
+
+```{r normalize}
+x_normalized_log <-
+  gene_counts %>%
+  select(all_of(sample_info$sample)) %>%
+  as.matrix() %>%
+  normalize.quantiles(keep.names = TRUE) %>%
+  {{ log2(. + 1) }}
+
+gene_counts_normalized_log <-
+  gene_counts %>%
+  select(gene_id, gene_name, gene_biotype) %>%
+  bind_cols(x_normalized_log)
+
+gene_counts_normalized_log %>%
+  write_csv('results/genes-normalized-log.csv')
+```
+
+```{r plot_data}
+fdr_th <- 0.0005
+fc_th <- 0
+
+plot_data <-
+  gene_counts_normalized_log %>%
+  select(gene_id, gene_name, all_of(sample_info$sample)) %>%
+  left_join(model, by = c('gene_id', 'gene_name')) %>%
+  filter(FDR < fdr_th) %>%
+  filter(abs(logFC) > fc_th)
+plot_info <-
+  sample_info %>%
+  arrange(side)
+```
+
+```{r draw_heatmap, echo=FALSE, fig.align="center", fig.width=8, fig.height=10, results='asis', include=TRUE, warning=FALSE}
+.x <-
+  plot_data %>%
+  select(any_of(plot_info$sample)) %>%
+  as.matrix() %>%
+  { t(scale(t(.))) }
+rownames(.x) <- plot_data$gene_name
+
+.col_fun <- colorRamp2(
+  seq(-2.5, 2.5, length.out = 24),
+  rev(colorRampPalette(brewer.pal(11, "RdBu"))(24))
+)
+
+.top_annotations = c(
+  columnAnnotation(
+    group = as.character(plot_info$group),
+    col = list(
+      'group' = c('c' = '#FDBF6F', 'i' = '#CAB2D6')
+    ),
+    show_legend = FALSE,
+    show_annotation_name = FALSE
+  )
+)
+
+.hc <-
+  .x %>%
+  (function(x) { 1 - cor(t(x)) }) %>%
+  as.dist() %>%
+  hclust()
+
+fdr_str <- format(fdr_th, scientific = FALSE)
+fc_str <- format(fc_th, scientific = FALSE)
+svg(
+  paste0('results/edger/heatmap-fdr-', fdr_str, '-fc-', fc_str, '.svg'),
+  width = 8,
+  height = 10
+)
+# ht_opt$ROW_ANNO_PADDING = unit(0.2, "cm")
+# ht_opt$TITLE_PADDING = unit(0.4, "cm")
+h_cerebellum <- Heatmap(
+  .x,
+  column_title = paste0('(FDR < ', fdr_str, '; abs(logFC) < ', fc_str, ')'),
+  cluster_columns = FALSE,
+  cluster_rows = .hc,
+  clustering_distance_rows = function(x) as.dist(1-cor(t(x))),
+  col = .col_fun,
+  show_row_names = TRUE,
+  show_column_names = T,
+  row_names_side = 'right',
+  row_dend_width = unit(3, 'cm'),
+  row_split = 2,
+  column_names_rot = 90,
+  column_split = rep(1:2, each = 18),
+  top_annotation = .top_annotations,
+  heatmap_legend_param = list(title = '', at = -3:3, legend_height = unit(3, 'cm')),
+)
+
+draw(h_cerebellum)
+decorate_annotation("group", {
+  grid.text(label = "c", gp = gpar(col = "black", fontsize = 11))
+}, slice = 1
+)
+decorate_annotation("group", {
+  grid.text(label = "i", gp = gpar(col = "black", fontsize = 11))
+}, slice = 2
+)
+dev.off()
+
+
+plot_data %>%
+  mutate(ct = cutree(.hc, k = 2)) %>%
+  write_csv(
+    paste0('results/edger/heatmap-clusters-fdr-', fdr_str, '-fc-', fc_str, '.csv'),
+  )
+```
+
+
